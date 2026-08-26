@@ -51,6 +51,7 @@ from sglang.kernels.ops.kvcache.kv_indices import (
     create_chunked_prefix_cache_kv_indices,
 )
 from sglang.srt.distributed.parallel_state import graph_capture
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.cp.bcg import (
     PrefillCPBCGInput,
@@ -82,7 +83,9 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     PPProxyTensors,
     compute_local_num_token_non_padded,
+    copy_dp_moe_valid_token_counts,
     enable_num_token_non_padded,
+    is_hybrid_ssm_model_runner,
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
@@ -350,6 +353,19 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self.dp_size = get_parallel().dp_size
         self.require_mlp_tp_gather = require_mlp_tp_gather(model_runner.server_args)
         self.require_attn_tp_gather = require_attn_tp_gather(model_runner.server_args)
+        enable_mask_dp_pad_moe = (
+            envs.SGLANG_OPT_MASK_DP_PAD_MOE.get()
+            and self.require_mlp_tp_gather
+            and get_parallel().attn_cp_size == 1
+            and not model_runner.server_args.enable_two_batch_overlap
+            and not model_runner.server_args.enable_pdmux
+        )
+        self._keep_hybrid_idle_rows = is_hybrid_ssm_model_runner(model_runner)
+        self._global_num_tokens_non_padded_gpu = (
+            torch.empty((self.dp_size,), dtype=torch.int32, device=self.device)
+            if enable_mask_dp_pad_moe
+            else None
+        )
 
         # --- backend ---------------------------------------------------
         # TcPiecewise resolves by running a compile pass that calls back into
@@ -676,6 +692,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             num_tokens,
             forward_batch.dp_padding_mode.is_max_len(),
             forward_batch.global_num_tokens_cpu,
+            self._global_num_tokens_non_padded_gpu,
         )
         set_is_extend_in_batch(False)
 
@@ -747,6 +764,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             num_tokens,
             fb.dp_padding_mode.is_max_len(),
             fb.global_num_tokens_cpu,
+            self._global_num_tokens_non_padded_gpu,
         )
         set_is_extend_in_batch(False)
 
@@ -1256,6 +1274,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             global_num_tokens_gpu = None
             global_num_tokens_for_logprob_gpu = None
 
+        if self._global_num_tokens_non_padded_gpu is not None:
+            self._global_num_tokens_non_padded_gpu.fill_(num_tokens)
+
         with torch.device(self.device):
             forward_batch = ForwardBatch(
                 forward_mode=ForwardMode.EXTEND,
@@ -1471,6 +1492,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             raw_num_tokens=num_tokens,
             padded_num_tokens=static_num_tokens,
         )
+        if self._global_num_tokens_non_padded_gpu is not None:
+            copy_dp_moe_valid_token_counts(
+                self._global_num_tokens_non_padded_gpu,
+                forward_batch,
+                static_num_tokens,
+                self._keep_hybrid_idle_rows,
+            )
 
         registry = self.buffer_registry
 

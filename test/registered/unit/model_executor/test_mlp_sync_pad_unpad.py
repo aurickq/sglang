@@ -11,14 +11,18 @@ Pure dataclass logic — CPU only.
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
+import pytest
 import torch
 
+from sglang.srt.environ import envs
+from sglang.srt.layers.dp_attention import DpPaddingMode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     DecodeCudaGraphRunner,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -62,16 +66,91 @@ class TestMlpSyncPadUnpad(CustomTestCase):
             can_run_dp_cuda_graph=True,
         )
 
-        fb.init_mlp_sync_metadata(batch, torch.device("cpu"))
+        with envs.SGLANG_OPT_MASK_DP_PAD_MOE.override(True):
+            fb.init_mlp_sync_metadata(batch, torch.device("cpu"))
 
         self.assertEqual(fb.original_global_num_tokens_cpu, [2, 0, 3])
         self.assertEqual(fb.global_num_tokens_cpu, [8, 0, 12])
         self.assertEqual(fb.global_num_tokens_for_logprob_cpu, [4, 0, 6])
         torch.testing.assert_close(fb.global_num_tokens_gpu, torch.tensor([8, 0, 12]))
         torch.testing.assert_close(
+            fb.global_num_tokens_non_padded_gpu,
+            torch.tensor([8, 0, 12], dtype=torch.int32),
+        )
+        torch.testing.assert_close(
             fb.global_num_tokens_for_logprob_gpu, torch.tensor([4, 0, 6])
         )
         self.assertTrue(fb.can_run_dp_cuda_graph)
+
+        with envs.SGLANG_OPT_MASK_DP_PAD_MOE.override(False):
+            fb.init_mlp_sync_metadata(batch, torch.device("cpu"))
+        self.assertIsNone(fb.global_num_tokens_non_padded_gpu)
+
+    def test_max_len_padding_preserves_moe_valid_counts(self):
+        batch = SimpleNamespace(
+            global_num_tokens=[3, 5],
+            global_num_tokens_for_logprob=[3, 5],
+            can_run_dp_cuda_graph=True,
+        )
+        model_runner = SimpleNamespace(
+            model_config=SimpleNamespace(hf_config=SimpleNamespace()),
+            is_draft_worker=False,
+            server_args=SimpleNamespace(enable_pdmux=False),
+        )
+        prefill_config = SimpleNamespace(bs=[])
+        execution = SimpleNamespace(
+            graph=SimpleNamespace(
+                cuda_graph_config=SimpleNamespace(prefill=prefill_config)
+            )
+        )
+
+        for attn_tp_size, padded_counts in ((1, [5, 5]), (4, [8, 8])):
+            with self.subTest(attn_tp_size=attn_tp_size):
+                fb = ForwardBatch(
+                    forward_mode=ForwardMode.DECODE,
+                    batch_size=3,
+                    input_ids=torch.arange(3),
+                    req_pool_indices=torch.arange(3),
+                    seq_lens=torch.ones(3, dtype=torch.int64),
+                    out_cache_loc=torch.arange(3),
+                    seq_lens_sum=3,
+                    positions=torch.arange(3),
+                )
+                with (
+                    envs.SGLANG_OPT_MASK_DP_PAD_MOE.override(True),
+                    patch.object(
+                        DpPaddingMode,
+                        "get_dp_padding_mode",
+                        return_value=DpPaddingMode.MAX_LEN,
+                    ),
+                    patch("sglang.srt.layers.cp.utils.enable_cp_v2", return_value=True),
+                    patch(
+                        "sglang.srt.model_executor.forward_batch_info.get_exec",
+                        return_value=execution,
+                    ),
+                    patch(
+                        "sglang.srt.model_executor.forward_batch_info.mambaish_config",
+                        return_value=None,
+                    ),
+                    patch(
+                        "sglang.srt.model_executor.forward_batch_info.set_dp_buffer_len"
+                    ) as set_dp_buffer_len,
+                    patch.object(fb, "_pad_inputs_to_size"),
+                    patch("sglang.srt.model_executor.forward_batch_info._is_cpu", True),
+                    get_parallel().override(
+                        attn_tp_size=attn_tp_size,
+                        attn_dp_rank=0,
+                        attn_cp_size=1,
+                    ),
+                ):
+                    fb.init_mlp_sync_metadata(batch, torch.device("cpu"))
+                    fb.prepare_mlp_sync_batch(model_runner)
+
+                self.assertEqual(fb.global_num_tokens_cpu, padded_counts)
+                torch.testing.assert_close(
+                    fb.global_num_tokens_gpu, torch.tensor(padded_counts)
+                )
+                self.assertEqual(set_dp_buffer_len.call_args.args[4].tolist(), [3, 5])
 
     def test_draft_input_without_hidden_states_can_be_padded(self):
         spec_info = SimpleNamespace(
@@ -201,6 +280,42 @@ class TestMlpSyncPadUnpad(CustomTestCase):
         self.assertEqual(fb.extend_seq_lens_cpu, [4])
         self.assertEqual(fb.extend_prefix_lens_cpu, [0])
         self.assertEqual(fb.extend_logprob_start_lens_cpu, [0])
+
+
+@pytest.mark.parametrize(
+    "counts,raw_counts,is_extend,keep_hybrid_idle_rows,expected",
+    [
+        ([3, 5], [3, 5], False, False, [3, 5]),
+        ([0, 5], [0, 5], False, False, [0, 5]),
+        ([0, 5], [0, 5], True, False, [8, 5]),
+        ([0, 5], [0, 5], False, True, [8, 5]),
+        (None, [3, 5], False, False, [8, 8]),
+    ],
+)
+def test_copy_dp_moe_valid_token_counts(
+    counts, raw_counts, is_extend, keep_hybrid_idle_rows, expected
+):
+    from sglang.srt.model_executor.forward_batch_info import (
+        copy_dp_moe_valid_token_counts,
+    )
+
+    dst = torch.empty(len(expected), dtype=torch.int32)
+    forward_batch = SimpleNamespace(
+        global_num_tokens_non_padded_gpu=(
+            None if counts is None else torch.tensor(counts)
+        ),
+        original_global_num_tokens_cpu=raw_counts,
+        is_extend_in_batch=is_extend,
+    )
+
+    copy_dp_moe_valid_token_counts(
+        dst,
+        forward_batch,
+        padded_num_tokens=8,
+        keep_hybrid_idle_rows=keep_hybrid_idle_rows,
+    )
+
+    torch.testing.assert_close(dst, torch.tensor(expected, dtype=torch.int32))
 
 
 if __name__ == "__main__":

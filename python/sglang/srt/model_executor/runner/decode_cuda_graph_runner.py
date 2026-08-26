@@ -66,8 +66,10 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     PPProxyTensors,
     compute_local_num_token_non_padded,
+    copy_dp_moe_valid_token_counts,
     enable_num_token_non_padded,
     get_required_capture_hidden_mode,
+    is_hybrid_ssm_model_runner,
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
@@ -362,6 +364,20 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 "tier); disable SGLANG_RAGGED_VERIFY_MODE or the conflicting "
                 "feature."
             )
+        enable_mask_dp_pad_moe = (
+            envs.SGLANG_OPT_MASK_DP_PAD_MOE.get()
+            and self.require_mlp_tp_gather
+            and get_parallel().attn_cp_size == 1
+            and not self.enable_two_batch_overlap
+            and not self.enable_pdmux
+            and not self.ragged_verify_mode
+        )
+        self._keep_hybrid_idle_rows = is_hybrid_ssm_model_runner(model_runner)
+        self._global_num_tokens_non_padded_gpu = (
+            torch.empty((self.dp_size,), dtype=torch.int32, device=self.device)
+            if enable_mask_dp_pad_moe
+            else None
+        )
 
         # Attention backend
         self.max_bs = max(self.capture_bs)
@@ -923,6 +939,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             )
             buffers.global_num_tokens_gpu.copy_(num_tokens_tensor)
             buffers.global_num_tokens_for_logprob_gpu.copy_(num_tokens_tensor)
+            if self._global_num_tokens_non_padded_gpu is not None:
+                self._global_num_tokens_non_padded_gpu.fill_(num_tokens)
         else:
             global_dp_buffer_len = None
 
@@ -1171,6 +1189,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     num_tokens,
                     forward_batch.dp_padding_mode.is_max_len(),
                     forward_batch.global_num_tokens_cpu,
+                    self._global_num_tokens_non_padded_gpu,
                 )
                 set_is_extend_in_batch(False)
 
@@ -1383,6 +1402,15 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             graph_size_key, stream_idx, variant_label, dsa_variant
         )
 
+    def _refresh_dp_moe_valid_token_counts(self, forward_batch: ForwardBatch) -> None:
+        if self._global_num_tokens_non_padded_gpu is not None:
+            copy_dp_moe_valid_token_counts(
+                self._global_num_tokens_non_padded_gpu,
+                forward_batch,
+                self.bs * self.captured_req_width,
+                self._keep_hybrid_idle_rows,
+            )
+
     def _ragged_graph_num_tokens(self, total_verify_tokens: int) -> int:
         from sglang.srt.speculative.ragged_verify import round_up_grid
 
@@ -1401,6 +1429,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         )
         with timer_ctx, self.backend.replay_session():
             self.load_batch(forward_batch, pp_proxy_tensors)
+            self._refresh_dp_moe_valid_token_counts(forward_batch)
             if envs.SGLANG_LOG_DECODE_GRAPH_KEY.get():
                 logger.info(
                     "Decode graph replay: worker=%s key_size=%s (%s) mode=%s raw_bs=%d%s",

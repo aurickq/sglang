@@ -82,6 +82,36 @@ _is_npu = is_npu()
 _is_cpu = is_cpu()
 
 
+def is_hybrid_ssm_model_runner(model_runner: ModelRunner) -> bool:
+    return mambaish_config(model_runner.model_config) is not None or (
+        model_runner.is_draft_worker
+        and getattr(
+            model_runner.model_config.hf_config,
+            "mtp_hybrid_override_pattern",
+            None,
+        )
+        is not None
+    )
+
+
+def copy_dp_moe_valid_token_counts(
+    dst: torch.Tensor,
+    forward_batch: ForwardBatch,
+    padded_num_tokens: int,
+    keep_hybrid_idle_rows: bool,
+) -> None:
+    counts = forward_batch.global_num_tokens_non_padded_gpu
+    if counts is None:
+        dst.fill_(padded_num_tokens)
+        return
+    dst.copy_(counts)
+    raw_counts = forward_batch.original_global_num_tokens_cpu
+    if 0 in (raw_counts or ()) and (
+        forward_batch.is_extend_in_batch or keep_hybrid_idle_rows
+    ):
+        dst.masked_fill_(dst == 0, padded_num_tokens)
+
+
 def _elastic_should_preserve_local_token_counts(
     *,
     model_runner: ModelRunner,
@@ -513,6 +543,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     _original_batch_size: Optional[int] = None
     _original_forward_mode: Optional[ForwardMode] = None
     _original_num_tokens: Optional[int] = None
+    global_num_tokens_non_padded_gpu: Optional[torch.Tensor] = None
     global_num_tokens_cpu: Optional[List[int]] = None
     global_num_tokens_gpu: Optional[torch.Tensor] = None
     # Has to be None when cuda graph is captured.
@@ -699,6 +730,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         self.global_num_tokens_gpu = torch.tensor(
             global_num_tokens, dtype=torch.int64
         ).to(device, non_blocking=True)
+        if envs.SGLANG_OPT_MASK_DP_PAD_MOE.get() and not self.can_run_tbo:
+            self.global_num_tokens_non_padded_gpu = self.global_num_tokens_gpu.to(
+                dtype=torch.int32
+            )
+        else:
+            self.global_num_tokens_non_padded_gpu = None
         self.global_num_tokens_for_logprob_cpu = global_num_tokens_for_logprob
         self.global_num_tokens_for_logprob_gpu = torch.tensor(
             global_num_tokens_for_logprob, dtype=torch.int64
@@ -1350,13 +1387,37 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         else:
             num_tokens = global_num_tokens[0]
 
+        hybrid_ssm = is_hybrid_ssm_model_runner(model_runner)
+        has_idle_rank = 0 in (self.original_global_num_tokens_cpu or ())
+        has_ragged_verify_layout = (
+            self.spec_info is not None
+            and self.spec_info.ragged_verify_layout is not None
+        )
+        non_padded_counts = self.global_num_tokens_non_padded_gpu
+        if (
+            not dp_padding_mode.is_max_len()
+            or get_parallel().attn_cp_size > 1
+            or self.can_run_tbo
+            or model_runner.server_args.enable_pdmux
+            or has_ragged_verify_layout
+        ):
+            non_padded_counts = None
+        elif (
+            non_padded_counts is not None
+            and has_idle_rank
+            and (self.is_extend_in_batch or hybrid_ssm)
+        ):
+            non_padded_counts = non_padded_counts.masked_fill(
+                non_padded_counts == 0, num_tokens
+            )
+
         self.global_dp_buffer_len = buffer_len
         set_dp_buffer_len(
             buffer_len,
             num_tokens,
             dp_padding_mode.is_max_len(),
             global_num_tokens,
-            self.global_num_tokens_gpu,
+            non_padded_counts,
         )
         set_is_extend_in_batch(self.is_extend_in_batch)
 
@@ -1371,15 +1432,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             # Mamba-hybrid families need the fabricated-row idle conversion
             # below; this includes their MTP draft workers, whose mamba-less
             # "*E" pattern makes mambaish_config return None.
-            hybrid_ssm = mambaish_config(model_runner.model_config) is not None or (
-                model_runner.is_draft_worker
-                and getattr(
-                    model_runner.model_config.hf_config,
-                    "mtp_hybrid_override_pattern",
-                    None,
-                )
-                is not None
-            )
             if (
                 hybrid_ssm
                 and self.spec_info is not None

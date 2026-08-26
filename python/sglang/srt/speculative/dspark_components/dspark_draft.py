@@ -23,10 +23,7 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.draft_worker_common import make_draft_input_v2
 from sglang.srt.speculative.dspark_components.dspark_planner import VerifyWindow
-from sglang.srt.speculative.spec_info import (
-    SpeculativeAlgorithm,
-    spec_scale_global_num_tokens,
-)
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import draft_tp_context
 from sglang.srt.utils.invariants import Bucket, Invariant, NotNaN, expect
 
@@ -447,28 +444,11 @@ class DraftBlockProposer:
         forward_batch.can_run_dp_cuda_graph = batch.can_run_dp_cuda_graph
         if not self._dp_moe_sync or batch.global_num_tokens is None:
             return
-        # Graph bucket selection uses the raw per-rank request counts.  Keep
-        # them separate from global_num_tokens_cpu below, which is scaled into
-        # draft-token units for DP/MoE synchronization.
-        forward_batch.original_global_num_tokens_cpu = batch.global_num_tokens
-        gnt, gnt_logprob = spec_scale_global_num_tokens(
-            self._draft_block_spec_info,
-            batch.global_num_tokens,
-            batch.global_num_tokens_for_logprob,
-        )
         device = self.draft_model_runner.device
-        forward_batch.original_global_num_tokens_cpu = batch.global_num_tokens
+        forward_batch.init_mlp_sync_metadata(batch, device)
         num_tokens = forward_batch.input_ids.numel()
         if enable_num_token_non_padded():
             forward_batch.num_token_non_padded = torch.tensor(
                 num_tokens, dtype=torch.int32, device=device
             )
         forward_batch.num_token_non_padded_cpu = num_tokens
-        forward_batch.global_num_tokens_cpu = gnt
-        forward_batch.global_num_tokens_for_logprob_cpu = gnt_logprob
-        forward_batch.global_num_tokens_gpu = torch.tensor(gnt, dtype=torch.int64).to(
-            device, non_blocking=True
-        )
-        forward_batch.global_num_tokens_for_logprob_gpu = torch.tensor(
-            gnt_logprob, dtype=torch.int64
-        ).to(device, non_blocking=True)

@@ -233,6 +233,7 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
                     forward_batch.mrope_positions
                 )
 
+        self._refresh_dp_moe_valid_token_counts(forward_batch)
         graph_key = self._make_graph_key(self.bs)
 
         if not (

@@ -5,6 +5,8 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.environ import envs
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.dspark_components.dspark_draft import DraftBlockProposer
 from sglang.srt.speculative.dspark_components.dspark_planner import (
     dp_global_verify_tier_num_tokens,
@@ -63,16 +65,28 @@ class TestDraftDpSyncMetadata(CustomTestCase):
         )
         proposer.draft_model_runner = SimpleNamespace(device="cpu")
 
-        forward_batch = SimpleNamespace(input_ids=torch.arange(6))
+        forward_batch = ForwardBatch(
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            batch_size=1,
+            input_ids=torch.arange(6),
+            req_pool_indices=torch.arange(1),
+            seq_lens=torch.ones(1, dtype=torch.int64),
+            out_cache_loc=torch.arange(6),
+            seq_lens_sum=1,
+            spec_info=proposer._draft_block_spec_info,
+        )
         batch = SimpleNamespace(
             global_num_tokens=[1, 3, 0, 2],
             global_num_tokens_for_logprob=[1, 3, 0, 2],
             can_run_dp_cuda_graph=True,
         )
 
-        with patch(
-            "sglang.srt.speculative.dspark_components.dspark_draft.enable_num_token_non_padded",
-            return_value=True,
+        with (
+            envs.SGLANG_OPT_MASK_DP_PAD_MOE.override(True),
+            patch(
+                "sglang.srt.speculative.dspark_components.dspark_draft.enable_num_token_non_padded",
+                return_value=True,
+            ),
         ):
             proposer._fill_dp_moe_sync_metadata(forward_batch, batch)
 
@@ -81,6 +95,10 @@ class TestDraftDpSyncMetadata(CustomTestCase):
             [1, 3, 0, 2],
         )
         self.assertEqual(forward_batch.global_num_tokens_cpu, [6, 18, 0, 12])
+        torch.testing.assert_close(
+            forward_batch.global_num_tokens_non_padded_gpu,
+            torch.tensor([6, 18, 0, 12], dtype=torch.int32),
+        )
         self.assertEqual(forward_batch.num_token_non_padded.item(), 6)
         self.assertEqual(forward_batch.num_token_non_padded.dtype, torch.int32)
         self.assertEqual(forward_batch.num_token_non_padded_cpu, 6)

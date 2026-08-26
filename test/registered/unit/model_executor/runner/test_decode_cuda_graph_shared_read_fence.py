@@ -1,3 +1,4 @@
+import contextlib
 from types import SimpleNamespace
 from unittest.mock import create_autospec
 
@@ -7,7 +8,7 @@ from sglang.srt.layers.attention.base_attn_backend import (
     AttentionBackend,
     SharedReadEnds,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     DecodeCudaGraphRunner,
 )
@@ -67,6 +68,27 @@ def test_publish_read_done():
     runner._publish_read_done(in_graph=False)
     assert recorded == ["record"]
     assert runner.model_runner.shared_read_done_event is not marker
+
+
+def test_execute_refreshes_valid_counts_after_load_before_replay():
+    calls = []
+    runner = _runner()
+    runner.model_runner.device_timer = None
+    runner.enable_pdmux = False
+    runner.bs = 0
+    runner._replay_graph_key = object()
+    runner.load_batch = lambda *_: calls.append("load")
+    runner._refresh_dp_moe_valid_token_counts = lambda *_: calls.append("refresh")
+    backend = SimpleNamespace(
+        shared_read_ends=lambda _: SharedReadEnds.UNKNOWN,
+        replay_session=contextlib.nullcontext,
+        replay=lambda *_: calls.append("replay") or PPProxyTensors({}),
+    )
+    runner.attn_backend = runner.backend = backend
+
+    runner.execute(SimpleNamespace(forward_mode=DECODE, batch_size=0))
+
+    assert calls == ["load", "refresh", "replay"]
 
 
 if __name__ == "__main__":
